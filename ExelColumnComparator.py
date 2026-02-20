@@ -22,7 +22,6 @@ F      = ("Segoe UI", 10)
 F_B    = ("Segoe UI", 10, "bold")
 F_T    = ("Segoe UI", 16, "bold")
 F_SUB  = ("Segoe UI", 12)
-F_MONO = ("Consolas", 10)
 
 
 class App:
@@ -268,7 +267,8 @@ class App:
             for tfile in self.template_files[1:]:
                 self.file_configs.append({"path": tfile, "sheet": self.cur_sheet,
                                          "header_row": self.cur_hdr_idx, "columns": cols})
-            self.show_pair_selector()
+            self.auto_generate_template_mappings()
+            self.run_comparison()
         elif self.temp_files:
             self.process_next_file()
         elif messagebox.askyesno("", f"{len(self.file_configs)} file(s) added.\nAdd another file?"):
@@ -394,23 +394,11 @@ class App:
 
         dfs = []
         for cfg in self.file_configs:
-            df = pd.read_excel(cfg["path"], header=cfg["header_row"],
-                               sheet_name=cfg["sheet"])
+            sheet = self.resolve_sheet_name(cfg["path"], cfg["sheet"])
+            df = pd.read_excel(cfg["path"], header=cfg["header_row"], sheet_name=sheet)
             dfs.append(df)
 
         loading.destroy()
-
-        def col_vals(df, col, hdr_row):
-            if col not in df.columns:
-                return {}
-            result = {}
-            for idx, val in df[col].dropna().items():
-                v = str(val).strip()
-                if v and v.lower() != "nan":
-                    excel_row = hdr_row + 2 + idx
-                    if v not in result:
-                        result[v] = excel_row
-            return result
 
         canvas = tk.Canvas(self.root, bg=C["bg"], highlightthickness=0)
         vsb = ttk.Scrollbar(self.root, orient=tk.VERTICAL, command=canvas.yview)
@@ -418,85 +406,84 @@ class App:
         self._res_inner.bind("<Configure>",
                              lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self._res_inner, anchor="nw", tags="inner")
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfigure("inner", width=e.width))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("inner", width=e.width))
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
-        self._res_canvas = canvas
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(-e.delta // 120, "units"))
         canvas.bind_all("<Button-4>", lambda _: canvas.yview_scroll(-3, "units"))
         canvas.bind_all("<Button-5>", lambda _: canvas.yview_scroll(3, "units"))
 
-        PREVIEW = 20
         f1_cfg = self.file_configs[0]
         f1_name = Path(f1_cfg["path"]).name
+        summary_data = []
 
         for fidx, col_pairs in sorted(self.mappings.items()):
             fN_cfg = self.file_configs[fidx]
             fN_name = Path(fN_cfg["path"]).name
 
-            vals1 = {}
-            valsN = {}
-            for c1, cN in col_pairs:
-                vals1.update(col_vals(dfs[0], c1, self.file_configs[0]["header_row"]))
-                valsN.update(col_vals(dfs[fidx], cN, fN_cfg["header_row"]))
+            col_data_1 = {c1: self.collect_col_data(dfs[0], c1, f1_cfg["header_row"])
+                          for c1, _ in col_pairs}
+            col_data_N = {cN: self.collect_col_data(dfs[fidx], cN, fN_cfg["header_row"])
+                          for _, cN in col_pairs}
 
-            only1_keys = sorted(set(vals1.keys()) - set(valsN.keys()))
-            onlyN_keys = sorted(set(valsN.keys()) - set(vals1.keys()))
-            common = set(vals1.keys()) & set(valsN.keys())
-            only1 = [(k, vals1[k]) for k in only1_keys]
-            onlyN = [(k, valsN[k]) for k in onlyN_keys]
+            all_vals_1 = {v for data in col_data_1.values() for v in data.values()}
+            all_vals_N = {v for data in col_data_N.values() for v in data.values()}
+            common     = all_vals_1 & all_vals_N
+            unique_1   = all_vals_1 - all_vals_N
+            unique_N   = all_vals_N - all_vals_1
+
+            rows_only_1 = self.get_rows_with_unique_values(col_data_1, unique_1)
+            rows_only_N = self.get_rows_with_unique_values(col_data_N, unique_N)
 
             card = tk.Frame(self._res_inner, bg=C["surface"],
                             highlightbackground=C["border"], highlightthickness=1)
             card.pack(fill=tk.X, pady=6, padx=4)
 
-            tk.Label(card, text=f"{f1_name} [{f1_cfg['sheet']}]   vs   {fN_name} [{fN_cfg['sheet']}]",
-                     font=F_B, bg=C["surface"], fg=C["text"]).pack(
-                padx=15, pady=(12, 2), anchor="w")
+            tk.Label(card,
+                     text=f"{f1_name} [{f1_cfg['sheet']}]   vs   {fN_name} [{fN_cfg['sheet']}]",
+                     font=F_B, bg=C["surface"], fg=C["text"]).pack(padx=15, pady=(12, 2), anchor="w")
 
-            # show which columns were mapped
             mapped_str = "    ".join(f"{c1}  ->  {cN}" for c1, cN in col_pairs)
             tk.Label(card, text=mapped_str, font=F,
                      bg=C["surface"], fg=C["dim"]).pack(padx=15, pady=(0, 4), anchor="w")
 
-            st = tk.Frame(card, bg=C["surface"])
-            st.pack(fill=tk.X, padx=15, pady=4)
-            tk.Label(st, text=f"Common: {len(common)}", font=F_B,
+            if self.template_mode:
+                self.show_template_validation_card(card, fN_cfg, fN_name)
+
+            stats = tk.Frame(card, bg=C["surface"])
+            stats.pack(fill=tk.X, padx=15, pady=4)
+            tk.Label(stats, text=f"Common: {len(common)}", font=F_B,
                      bg=C["surface"], fg=C["green"]).pack(side=tk.LEFT, padx=(0, 18))
-            tk.Label(st, text=f"Only in {f1_name}: {len(only1)}", font=F_B,
+            tk.Label(stats, text=f"Only in {f1_name}: {len(rows_only_1)}", font=F_B,
                      bg=C["surface"], fg=C["accent"]).pack(side=tk.LEFT, padx=(0, 18))
-            tk.Label(st, text=f"Only in {fN_name}: {len(onlyN)}", font=F_B,
+            tk.Label(stats, text=f"Only in {fN_name}: {len(rows_only_N)}", font=F_B,
                      bg=C["surface"], fg=C["orange"]).pack(side=tk.LEFT)
 
-            if only1:
-                self._exp(card, f"Only in {f1_name}", only1, PREVIEW, C["accent"],
-                         f1_cfg["path"], col_pairs[0][0], f1_cfg["sheet"], f1_cfg["header_row"], dfs[0], [k for k,r in only1])
-            if onlyN:
-                self._exp(card, f"Only in {fN_name}", onlyN, PREVIEW, C["orange"],
-                         fN_cfg["path"], col_pairs[0][1], fN_cfg["sheet"], fN_cfg["header_row"], dfs[fidx], [k for k,r in onlyN])
-            tk.Frame(card, bg=C["surface"], height=8).pack()
+            cols_1 = [c1 for c1, _ in col_pairs]
+            cols_N = [cN for _, cN in col_pairs]
 
-        # summary
+            if rows_only_1:
+                self.show_comparison_grid(card, f"Only in {f1_name}", cols_1,
+                                          rows_only_1, C["accent"], f1_cfg["path"])
+            if rows_only_N:
+                self.show_comparison_grid(card, f"Only in {fN_name}", cols_N,
+                                          rows_only_N, C["orange"], fN_cfg["path"])
+
+            tk.Frame(card, bg=C["surface"], height=8).pack()
+            summary_data.append((f1_name, fN_name, len(common),
+                                  len(rows_only_1), len(rows_only_N), fidx + 1))
+
         sm = tk.Frame(self._res_inner, bg=C["hdr_bg"],
                       highlightbackground=C["border"], highlightthickness=1)
         sm.pack(fill=tk.X, pady=6, padx=4)
         tk.Label(sm, text="Summary", font=F_T, fg=C["purple"],
                  bg=C["hdr_bg"]).pack(padx=15, pady=(12, 4), anchor="w")
-        for fidx, col_pairs in sorted(self.mappings.items()):
-            fN_name = Path(self.file_configs[fidx]["path"]).name
-            vals1 = {}
-            valsN = {}
-            for c1, cN in col_pairs:
-                vals1.update(col_vals(dfs[0], c1, self.file_configs[0]["header_row"]))
-                valsN.update(col_vals(dfs[fidx], cN, self.file_configs[fidx]["header_row"]))
-            common = set(vals1.keys()) & set(valsN.keys())
-            u1 = set(vals1.keys()) - set(valsN.keys())
-            uN = set(valsN.keys()) - set(vals1.keys())
-            tk.Label(sm, text=f"{f1_name} vs {fN_name}:  "
-                     f"{len(common)} common,  {len(u1)} unique to #1,  {len(uN)} unique to #{fidx+1}",
+        for f1_n, fN_n, common_c, u1_c, uN_c, num in summary_data:
+            tk.Label(sm,
+                     text=f"{f1_n} vs {fN_n}:  {common_c} common,  "
+                          f"{u1_c} unique to #1,  {uN_c} unique to #{num}",
                      font=F, fg=C["dim"], bg=C["hdr_bg"]).pack(padx=15, anchor="w")
         tk.Frame(sm, bg=C["hdr_bg"], height=12).pack()
 
@@ -505,54 +492,91 @@ class App:
         ttk.Button(bot, text="New Comparison", style="A.TButton",
                    command=self._new_comparison).pack(side=tk.RIGHT)
 
-    def _copy_to_clipboard(self, text):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        messagebox.showinfo("", "Copied to clipboard")
-
-    def _open_excel_file(self, file_path):
-        if sys.platform == 'win32':
-            os.startfile(file_path)
-        elif sys.platform == 'darwin':
-            subprocess.Popen(['open', file_path])
-        else:
-            subprocess.Popen(['xdg-open', file_path])
-
-    def _show_excel_window(self, file_path, column, sheet, hdr_row, df, unique_vals, scroll_to=None):
-        win = tk.Toplevel(self.root)
-        win.title(f"Excel: {Path(file_path).name} - {column}")
-        win.geometry("900x600")
-
-        tree = ttk.Treeview(win, style="T.Treeview", show="headings")
-        xscr = ttk.Scrollbar(win, orient=tk.HORIZONTAL, command=tree.xview)
-        yscr = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(xscrollcommand=xscr.set, yscrollcommand=yscr.set)
-
-        cols = [column]
-        tree["columns"] = cols
-        tree.heading("#0", text="Row")
-        tree.column("#0", width=50, anchor="center")
-        tree.heading(column, text=column)
-        tree.column(column, width=200)
-
-        unique_set = set(unique_vals)
-        for idx, val in df[column].dropna().items():
+    def collect_col_data(self, df, col_name, hdr_row):
+        if col_name not in df.columns:
+            return {}
+        result = {}
+        for idx, val in df[col_name].dropna().items():
             v = str(val).strip()
             if v and v.lower() != "nan":
-                excel_row = hdr_row + 1 + idx
-                tag = "unique" if v in unique_set else "normal"
-                tree.insert("", "end", iid=str(excel_row), text=str(excel_row), values=(v,), tags=(tag,))
+                result[hdr_row + 2 + idx] = v
+        return result
 
-        tree.tag_configure("unique", background=C["red"], foreground="#fff")
+    def get_rows_with_unique_values(self, col_data, unique_values):
+        rows = {}
+        for col_name, data in col_data.items():
+            for excel_row, val in data.items():
+                if val in unique_values:
+                    rows.setdefault(excel_row, {})[col_name] = val
+        return rows
+
+    def show_comparison_grid(self, parent, title, col_names, rows_data, color, file_path):
+        fr = tk.Frame(parent, bg=C["surface"])
+        fr.pack(fill=tk.X, padx=15, pady=(6, 2))
+
+        hdr = tk.Frame(fr, bg=C["surface"])
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=f"{title}:", font=F_B, bg=C["surface"],
+                 fg=color).pack(side=tk.LEFT, anchor="w")
+        tk.Button(hdr, text="Open in Excel", font=F, bg=C["surface"], fg=color,
+                  relief="flat", cursor="hand2", activebackground=C["alt"],
+                  activeforeground=color,
+                  command=lambda: self._open_excel_file(file_path)).pack(side=tk.LEFT, padx=8)
+
+        grid_frame = tk.Frame(fr, bg=C["surface"])
+        grid_frame.pack(fill=tk.X, pady=(4, 2))
+
+        all_columns = ["Row"] + col_names
+        tree_height = min(len(rows_data), 10)
+        tree = ttk.Treeview(grid_frame, columns=all_columns, show="headings",
+                            style="T.Treeview", height=tree_height)
+        yscr = ttk.Scrollbar(grid_frame, orient=tk.VERTICAL, command=tree.yview)
+        xscr = ttk.Scrollbar(grid_frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=yscr.set, xscrollcommand=xscr.set)
+
+        tree.heading("Row", text="Row")
+        tree.column("Row", width=60, anchor="center", stretch=False)
+        for col in col_names:
+            tree.heading(col, text=col)
+            tree.column(col, width=200, minwidth=80)
+
+        for i, excel_row in enumerate(sorted(rows_data)):
+            values = [str(excel_row)] + [rows_data[excel_row].get(col, "") for col in col_names]
+            tree.insert("", "end", values=values, tags=("alt" if i % 2 else "normal",))
+
+        tree.tag_configure("alt", background=C["alt"])
         tree.tag_configure("normal", background=C["surface"])
+
+        def on_double_click(event):
+            item = tree.identify_row(event.y)
+            col  = tree.identify_column(event.x)
+            if not item or not col:
+                return
+            col_index = int(col.replace("#", "")) - 1
+            values = tree.item(item, "values")
+            if values and col_index < len(values) and values[col_index]:
+                self._copy_to_clipboard(values[col_index])
+
+        tree.bind("<Double-1>", on_double_click)
 
         yscr.pack(side=tk.RIGHT, fill=tk.Y)
         xscr.pack(side=tk.BOTTOM, fill=tk.X)
-        tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        tree.pack(fill=tk.X)
 
-        if scroll_to:
-            tree.see(str(scroll_to))
-            tree.selection_set(str(scroll_to))
+    def _copy_to_clipboard(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        original_title = self.root.title()
+        self.root.title(f"Copied: {text}")
+        self.root.after(1500, lambda: self.root.title(original_title))
+
+    def _open_excel_file(self, file_path):
+        if sys.platform == "win32":
+            os.startfile(file_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", file_path])
+        else:
+            subprocess.Popen(["xdg-open", file_path])
 
     def _new_comparison(self):
         self.file_configs = []
@@ -563,42 +587,85 @@ class App:
         self.template_config = None
         self.pick_files()
 
-    def _exp(self, parent, title, items, n, color, file_path=None, column=None, sheet=None, hdr_row=None, df=None, unique_vals=None):
-        fr = tk.Frame(parent, bg=C["surface"])
-        fr.pack(fill=tk.X, padx=15, pady=2)
-        hdr_fr = tk.Frame(fr, bg=C["surface"])
-        hdr_fr.pack(fill=tk.X)
-        tk.Label(hdr_fr, text=title + ":", font=F_B, bg=C["surface"],
-                 fg=color).pack(side=tk.LEFT, anchor="w")
-        if file_path:
-            tk.Button(hdr_fr, text="Open Excel", font=F, bg=C["surface"],
-                     fg=color, relief="flat", cursor="hand2",
-                     command=lambda fp=file_path: self._open_excel_file(fp),
-                     activeforeground=color, activebackground=C["alt"]).pack(side=tk.LEFT, padx=(10, 0))
-        inner = tk.Frame(fr, bg=C["surface"])
-        inner.pack(fill=tk.X, padx=16)
-        for v, row in items[:n]:
-            lbl = tk.Label(inner, text=f"  Row {row}: {v}", font=F_MONO, bg=C["surface"],
-                     fg=C["text"], cursor="hand2")
-            lbl.pack(anchor="w")
-            lbl.bind("<Button-1>", lambda e, val=v: self._copy_to_clipboard(val))
-        if len(items) > n:
-            rest = items[n:]
-            def show(rest=rest):
-                btn.destroy()
-                for v, row in rest:
-                    lbl = tk.Label(inner, text=f"  Row {row}: {v}", font=F_MONO,
-                             bg=C["surface"], fg=C["text"], cursor="hand2")
-                    lbl.pack(anchor="w")
-                    lbl.bind("<Button-1>", lambda e, val=v: self._copy_to_clipboard(val))
-                self._res_inner.update_idletasks()
-                self._res_canvas.configure(
-                    scrollregion=self._res_canvas.bbox("all"))
-            btn = tk.Button(inner, text=f"Show all {len(items)} items  v",
-                            command=show, font=F, fg=color, bg=C["surface"],
-                            relief="flat", cursor="hand2",
-                            activeforeground=color, activebackground=C["alt"])
-            btn.pack(anchor="w", pady=3)
+    # ── Template validation ──────────────────────────────────────────────
+    def resolve_sheet_name(self, file_path, preferred_sheet):
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        result = preferred_sheet if preferred_sheet in wb.sheetnames else wb.sheetnames[0]
+        wb.close()
+        return result
+
+    def auto_generate_template_mappings(self):
+        template_cols = self.template_config["columns"]
+        self.mappings = {fidx: [(c, c) for c in template_cols]
+                         for fidx in range(1, len(self.file_configs))}
+
+    def get_columns_at_row(self, file_path, sheet_name, row_index):
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[sheet_name]
+        result = []
+        for i, row in enumerate(ws.iter_rows(max_row=row_index + 1, max_col=40)):
+            if i == row_index:
+                result = [str(c.value).strip() for c in row if c.value is not None]
+        wb.close()
+        return result
+
+    def find_actual_header_row(self, file_path, sheet_name, expected_columns):
+        expected_lower = {c.lower() for c in expected_columns}
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[sheet_name]
+        best_row, best_match = None, 0
+        for row_idx, row in enumerate(ws.iter_rows(max_row=50, max_col=40)):
+            row_vals = {str(c.value).strip().lower() for c in row if c.value is not None}
+            match_count = len(expected_lower & row_vals)
+            if match_count > best_match:
+                best_match, best_row = match_count, row_idx
+        wb.close()
+        return best_row if best_match >= max(1, len(expected_lower) * 0.5) else None
+
+    def validate_file_against_template(self, file_cfg):
+        expected_row = self.template_config["header_row"]
+        template_cols = self.template_config["columns"]
+        template_sheet = self.template_config["sheet"]
+        wb = load_workbook(file_cfg["path"], data_only=True, read_only=True)
+        sheet_found = template_sheet in wb.sheetnames
+        actual_sheet = template_sheet if sheet_found else wb.sheetnames[0]
+        wb.close()
+        actual_cols = self.get_columns_at_row(file_cfg["path"], actual_sheet, expected_row)
+        missing = [c for c in template_cols if c not in actual_cols]
+        extra = [c for c in actual_cols if c not in template_cols]
+        actual_row = None
+        if missing:
+            found = self.find_actual_header_row(file_cfg["path"], actual_sheet, template_cols)
+            actual_row = (found + 1) if found is not None else None
+        return {"expected_row": expected_row + 1, "missing": missing, "extra": extra,
+                "actual_row": actual_row, "sheet_found": sheet_found,
+                "expected_sheet": template_sheet, "actual_sheet": actual_sheet}
+
+    def show_template_validation_card(self, parent, file_cfg, file_name):
+        v = self.validate_file_against_template(file_cfg)
+        bg = C["surface2"]
+        vcard = tk.Frame(parent, bg=bg, highlightbackground=C["border"], highlightthickness=1)
+        vcard.pack(fill=tk.X, padx=15, pady=(2, 8))
+        has_issues = not v["sheet_found"] or v["missing"]
+        if not has_issues:
+            tk.Label(vcard,
+                     text=f"Template check \u2713  {file_name}  \u2014  sheet '{v['expected_sheet']}', row {v['expected_row']}, all columns found",
+                     font=F_B, bg=bg, fg=C["green"]).pack(padx=10, pady=6, anchor="w")
+            return
+        tk.Label(vcard, text=f"Template mismatch \u2717  {file_name}",
+                 font=F_B, bg=bg, fg=C["red"]).pack(padx=10, pady=(6, 2), anchor="w")
+        if not v["sheet_found"]:
+            tk.Label(vcard, text=f"  Sheet '{v['expected_sheet']}' not found  \u2014  using '{v['actual_sheet']}' instead",
+                     font=F, bg=bg, fg=C["orange"]).pack(padx=10, pady=1, anchor="w")
+        if v["missing"]:
+            row_msg = f"row {v['expected_row']}"
+            if v["actual_row"]:
+                row_msg += f"  (header found at row {v['actual_row']})"
+            tk.Label(vcard, text=f"  Header mismatch at {row_msg}  \u2014  missing: {',  '.join(v['missing'])}",
+                     font=F, bg=bg, fg=C["orange"]).pack(padx=10, pady=1, anchor="w")
+        if v["extra"]:
+            tk.Label(vcard, text=f"  Unexpected columns: {',  '.join(v['extra'])}",
+                     font=F, bg=bg, fg=C["dim"]).pack(padx=10, pady=(1, 6), anchor="w")
 
     def _back(self):
         if len(self.history) < 2:
